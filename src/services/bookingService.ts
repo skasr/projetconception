@@ -56,12 +56,12 @@ export async function createBooking(
     }
 
     if (overlapsMaintenance(room, start, end)) {
-      throw new DomainError('maintenance', 'la salle est en maintenance sur ce créneau');
+      throw new DomainError('maintenance', 'salle en maintenance sur ce créneau');
     }
 
     const upcoming = await countUpcomingConfirmed(client, input.memberId, now);
     if (upcoming >= 2) {
-      throw new DomainError('too_many_bookings', 'le membre a déjà 2 réservations à venir');
+      throw new DomainError('too_many_bookings', 'ce membre a déjà 2 réservations à venir');
     }
 
     const booking: Booking = {
@@ -92,7 +92,12 @@ export async function createBooking(
   }
 }
 
-export async function cancelBooking(pool: Pool, bookingId: string, now: Date): Promise<BookingStatus> {
+export interface CancelResult {
+  status: BookingStatus;
+  roomId: string;
+}
+
+export async function cancelBooking(pool: Pool, bookingId: string, now: Date): Promise<CancelResult> {
   const client = await pool.connect();
   try {
     await client.query('begin');
@@ -109,7 +114,7 @@ export async function cancelBooking(pool: Pool, bookingId: string, now: Date): P
     await updateStatus(client, bookingId, status);
 
     await client.query('commit');
-    return status;
+    return { status, roomId: booking.roomId };
   } catch (err) {
     await client.query('rollback');
     throw err;

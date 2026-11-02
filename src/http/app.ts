@@ -6,10 +6,12 @@ import { listRooms, getRoom } from '../db/rooms';
 import { listRoomPlanning, listMemberBookings, getBooking } from '../db/bookings';
 import { memberExists } from '../db/members';
 import { createBooking, cancelBooking } from '../services/bookingService';
+import type { PlanningCache, SerializedBooking } from '../cache/planningCache';
 
 export interface AppDeps {
   pool: Pool;
   clock: () => Date;
+  cache?: PlanningCache;
 }
 
 const statusByCode: Record<ErrorCode, number> = {
@@ -23,7 +25,7 @@ const statusByCode: Record<ErrorCode, number> = {
   already_cancelled: 409,
 };
 
-function bookingJson(booking: Booking) {
+function bookingJson(booking: Booking): SerializedBooking {
   return {
     id: booking.id,
     roomId: booking.roomId,
@@ -49,7 +51,7 @@ function wrap(handler: (req: Request, res: Response) => Promise<void>) {
 }
 
 export function createApp(deps: AppDeps) {
-  const { pool, clock } = deps;
+  const { pool, clock, cache } = deps;
   const app = express();
   app.use(express.json());
 
@@ -74,10 +76,22 @@ export function createApp(deps: AppDeps) {
       if (!room) {
         throw new DomainError('room_not_found', 'salle inconnue');
       }
+
+      let planning = cache ? await cache.get(req.params.id) : null;
+      if (!planning) {
+        const bookings = await listRoomPlanning(pool, req.params.id, null, null);
+        planning = bookings.map(bookingJson);
+        if (cache) {
+          await cache.set(req.params.id, planning);
+        }
+      }
+
       const from = parseDate(req.query.from);
       const to = parseDate(req.query.to);
-      const bookings = await listRoomPlanning(pool, req.params.id, from, to);
-      res.json(bookings.map(bookingJson));
+      const filtered = planning.filter(
+        (b) => (!from || new Date(b.end) > from) && (!to || new Date(b.start) < to),
+      );
+      res.json(filtered);
     }),
   );
 
@@ -86,9 +100,12 @@ export function createApp(deps: AppDeps) {
     wrap(async (req, res) => {
       const { memberId, start, end } = req.body ?? {};
       if (typeof memberId !== 'string' || typeof start !== 'string' || typeof end !== 'string') {
-        throw new DomainError('invalid_slot', 'memberId, start et end sont requis');
+        throw new DomainError('invalid_slot', 'il manque memberId, start ou end');
       }
       const booking = await createBooking(pool, req.params.id, { memberId, start, end }, clock());
+      if (cache) {
+        await cache.invalidate(booking.roomId);
+      }
       res.status(201).location(`/bookings/${booking.id}`).json(bookingJson(booking));
     }),
   );
@@ -107,7 +124,10 @@ export function createApp(deps: AppDeps) {
   app.delete(
     '/bookings/:id',
     wrap(async (req, res) => {
-      await cancelBooking(pool, req.params.id, clock());
+      const result = await cancelBooking(pool, req.params.id, clock());
+      if (cache) {
+        await cache.invalidate(result.roomId);
+      }
       res.status(204).end();
     }),
   );
