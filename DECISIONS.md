@@ -3,121 +3,80 @@
 ## Les couches
 
 ```
-        HTTP (Express)
-          routes, lecture du corps, validation de forme,
-          traduction en codes de statut
-                |
-        Services
-          orchestration, transactions, verrous,
-          reçoivent l'horloge en paramètre
-            /         \
-     Domaine          Repositories
-     (pur)            (SQL via pg)
-     règles métier    accès PostgreSQL
-     aucune I/O
-                |
-     Infra : pool pg, client redis, config
+HTTP (Express)   -> routes, validation de forme, codes de statut
+Services         -> transactions, verrous, reçoit l'horloge
+Domaine          -> règles métier, pur, aucune I/O
+Repositories     -> SQL via pg
 ```
 
-Les dépendances vont du haut vers le bas. Le domaine ne dépend de rien (pas de base,
-pas d'Express, pas d'horloge système). Les services appellent le domaine pour décider
-et les repositories pour lire/écrire. Les handlers HTTP restent fins : ils lisent la
-requête, appellent un service et choisissent le code de statut.
+Les dépendances vont vers le bas. Le domaine dépend de rien (ni base, ni Express, ni
+heure), donc testable tout seul. Les services font le lien. Les handlers HTTP sont bêtes :
+lire la requête, appeler un service, renvoyer le code.
 
-L'horloge n'est jamais lue dans le domaine. Une valeur `now: Date` est calculée à
-l'entrée (handler HTTP en vrai, horloge fixe dans les tests) et descend en paramètre.
+Important : l'heure est jamais lue dans le domaine. On passe un `now: Date` depuis l'entrée
+(vrai `new Date()` dans le serveur, date fixe dans les tests). Sinon les règles au temps
+seraient pas testables.
 
 ## Où vit chaque règle
 
-| Règle métier | Où | Pourquoi |
+| Règle | Où | Pourquoi |
 |---|---|---|
-| Durée de 1 h à 4 h, début à l'heure pleine, entre 10 h et 23 h | Domaine (validation pure) + `CHECK (end_at > start_at)` en base | C'est la forme du créneau, ça ne dépend ni de l'état de la base ni de l'heure |
-| Deux réservations d'une même salle ne se chevauchent jamais, même en concurrence | PostgreSQL : contrainte d'exclusion GiST sur `room_id` + `tstzrange(start_at, end_at)`, bornes `[)` | Seule la base tient l'invariant quand deux requêtes arrivent en même temps. Les bornes demi-ouvertes laissent un créneau commencer à l'heure exacte où le précédent finit. Le service fait en plus une vérification de courtoisie pour renvoyer un 409 lisible |
-| Un membre a au plus 2 réservations à venir | Service, dans une transaction, avec `SELECT ... FOR UPDATE` sur la ligne du membre | Invariant d'agrégat sur plusieurs lignes, filtré par l'horloge (« à venir ») : pas exprimable par une contrainte de ligne. Voir ADR 2 |
-| Annulation → `cancelled`, ou `late_cancelled` si moins de 24 h avant le début ; pas deux fois | Domaine (choix du statut depuis `now`) + repository pour l'`UPDATE` | « moins de 24 h » dépend de l'horloge injectée ; « pas deux fois » = on n'annule que depuis `confirmed` |
-| Une salle en maintenance refuse toute réservation qui empiète sur la période | Domaine (comparaison de deux plages) | Règle pure entre la plage demandée et la fenêtre de maintenance de la salle |
+| Durée 1–4 h, heure pleine, 10 h–23 h | Domaine + `CHECK (end_at > start_at)` | Juste la forme du créneau, dépend pas de la base ni de l'heure |
+| Pas de chevauchement, même en concurrence | Postgres : exclusion GiST (`room_id` + `tstzrange`), bornes `[)` | Y'a que la base qui tient ça quand 2 requêtes arrivent en même temps. Bornes `[)` = un créneau peut commencer pile à la fin du précédent. Le service vérifie avant aussi, pour un 409 plus clair |
+| Max 2 résas à venir par membre | Service, transaction + `SELECT ... FOR UPDATE` sur le membre | Compte plusieurs lignes et dépend de l'heure, pas faisable en contrainte de ligne. Voir ADR 2 |
+| Annulation → `cancelled` / `late_cancelled` (<24 h), pas 2 fois | Domaine (statut selon `now`) + repo pour l'`UPDATE` | Le <24 h dépend de l'horloge ; on annule que depuis `confirmed` |
+| Maintenance : refus si chevauchement | Domaine (compare 2 plages) | Règle pure entre le créneau demandé et la fenêtre de maintenance |
 
-La limite de 2 réservations est la seule règle qui regarde plusieurs lignes à la fois
-et qui bouge avec l'heure. Elle ne peut pas descendre dans une contrainte `CHECK`
-(qui ne voit qu'une ligne) ni dans la contrainte d'exclusion (qui ne compte pas). Elle
-reste donc dans le service, sous verrou, pour rester correcte en concurrence.
+La limite des 2 c'est la seule un peu chiante : elle regarde plusieurs lignes et dépend de
+l'heure. Pas possible en `CHECK` (voit 1 ligne) ni dans l'exclusion (compte pas). Donc dans
+le service, sous verrou.
 
 ## Codes de statut (POST /rooms/:id/bookings)
 
-- Corps mal formé ou créneau qui ne respecte pas la forme (durée, heure pleine,
-  plage 10 h–23 h, `end` avant `start`) → **400**
-- Salle ou membre inexistant → **404**
-- Chevauchement, limite de 2 réservations atteinte, salle en maintenance → **409**
+- 400 : corps mal formé, ou créneau hors règles de forme
+- 404 : salle ou membre inconnu
+- 409 : chevauchement, limite de 2 atteinte, maintenance
 
-Pour `DELETE /bookings/:id` : 204 si l'annulation passe, 404 si la réservation
-n'existe pas, 409 si elle est déjà annulée.
+`DELETE /bookings/:id` : 204 ok, 404 inconnue, 409 déjà annulée.
 
 ## Modèle relationnel
 
 ```
-rooms
-  id               text  PK
-  name             text  not null
-  capacity         integer not null
-  maintenance_start timestamptz  null
-  maintenance_end   timestamptz  null
-
-members
-  id    text  PK
-  name  text  not null
-
-bookings
-  id         text  PK
-  room_id    text  not null -> rooms(id)
-  member_id  text  not null -> members(id)
-  start_at   timestamptz  not null
-  end_at     timestamptz  not null
-  status     text  not null  default 'confirmed'
-             check status in ('confirmed','cancelled','late_cancelled')
-  check (end_at > start_at)
-  exclude using gist (room_id with =, tstzrange(start_at, end_at) with &&)
-         where (status = 'confirmed')
+rooms(id PK, name, capacity, maintenance_start null, maintenance_end null)
+members(id PK, name)
+bookings(id PK, room_id -> rooms, member_id -> members,
+         start_at, end_at, status default 'confirmed',
+         check status in ('confirmed','cancelled','late_cancelled'),
+         check (end_at > start_at),
+         exclude gist (room_id =, tstzrange(start_at,end_at) &&) where status='confirmed')
 ```
 
-La fenêtre de maintenance est portée par deux colonnes nullables sur `rooms` (plutôt
-qu'une table séparée) : il y a au plus une période par salle dans l'énoncé. La
-contrainte d'exclusion ne filtre que les réservations `confirmed`, donc une annulation
-libère tout de suite le créneau pour une nouvelle réservation.
+Maintenance = 2 colonnes nullables sur `rooms`, pas une table à part (au plus 1 période par
+salle dans l'énoncé). L'exclusion filtre que les `confirmed`, donc une annulation libère le
+créneau direct.
 
-## ADR 1 — Driver `pg` et SQL écrit à la main, pas d'ORM
+## ADR 1 — driver `pg` et SQL à la main, pas d'ORM
 
-**Contexte.** Il faut accéder à PostgreSQL depuis TypeScript. Le point délicat du sujet
-est une contrainte d'exclusion GiST avec `tstzrange` et l'extension `btree_gist`, qui
-ne fait partie d'aucun modèle d'ORM courant.
+Le point relou du sujet c'est l'exclusion GiST avec `tstzrange` + `btree_gist`, qui rentre
+dans aucun ORM. Donc driver `pg` et SQL écrit à la main, migration en fichier `.sql`.
 
-**Décision.** On utilise le driver `pg` et on écrit le SQL. La migration est un fichier
-`.sql` appliqué par un petit script.
+Un ORM (Prisma, TypeORM) ferait les entités et les migrations, mais l'exclusion faudrait
+quand même l'écrire en SQL brut, et l'ORM cacherait les requêtes que justement je veux
+regarder avec `EXPLAIN ANALYZE`. Pas assez de gain pour une couche en plus, donc non.
 
-**Pourquoi pas un ORM.** Un ORM (Prisma, TypeORM) apporterait des entités et des
-migrations générées, mais la contrainte d'exclusion devrait quand même être écrite à la
-main dans une migration brute, et l'ORM masquerait le SQL qu'on cherche justement à
-mesurer plus tard (`EXPLAIN ANALYZE`, index). Le gain serait faible pour une surcouche
-en plus. On refuse donc l'ORM ici.
+Conséquence : plus de SQL à écrire, mais contrôle total. Tout est paramétré (pas
+d'injection).
 
-**Conséquences.** Plus de SQL à écrire et à relire, mais un contrôle total du schéma et
-des requêtes. Les requêtes sont paramétrées pour éviter les injections.
+## ADR 2 — la limite « 2 à venir » dans le service, pas en base
 
-## ADR 2 — La limite « 2 réservations à venir » vit dans le service, pas en base
+« À venir » se calcule par rapport à maintenant, et la règle compte plusieurs lignes. Je la
+mets dans le service, dans la transaction de l'insert : verrou sur le membre
+(`SELECT ... FOR UPDATE`), je compte ses résas `confirmed` avec `start_at > now`, refus s'il
+en a déjà 2.
 
-**Contexte.** Un membre ne peut pas avoir plus de 2 réservations à venir. « À venir »
-se calcule par rapport à l'instant courant, et la règle compte plusieurs lignes.
+Pourquoi pas en base : un `CHECK` sait pas compter, et un trigger devrait lire `now()` en
+base alors que je veux une horloge injectée et testable. Du coup l'heure reste à un seul
+endroit.
 
-**Décision.** La règle est vérifiée dans le service, dans la même transaction que
-l'insertion. On verrouille d'abord la ligne du membre (`SELECT ... FOR UPDATE`), on
-compte ses réservations `confirmed` dont `start_at > now`, et on refuse si on atteint
-déjà 2.
-
-**Pourquoi pas un trigger ou une contrainte.** Une contrainte `CHECK` ne voit qu'une
-ligne, elle ne peut pas compter. Un trigger pourrait compter, mais il devrait lire
-l'heure en base (`now()`), alors qu'on veut une horloge injectée et testable avec une
-valeur fixe. Mettre la règle dans le service garde l'heure à un seul endroit et rend la
-règle testable sans la base.
-
-**Conséquences.** Deux requêtes simultanées pour le même membre se sérialisent grâce au
-verrou de ligne, donc on ne peut pas dépasser 2 par une course. Le verrou est pris par
-membre, il ne bloque pas les réservations des autres membres.
+Conséquence : avec le verrou, 2 requêtes en même temps pour le même membre se mettent à la
+queue, pas moyen de passer à 3. Et ça bloque pas les autres membres.
